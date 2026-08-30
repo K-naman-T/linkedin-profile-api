@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>LinkedIn Profile Fetcher — Bookmarklet</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; max-width: 700px; margin: 40px auto; padding: 20px; background: #f5f5f5; }
+        h1 { color: #0a66c2; }
+        .bookmarklet-link { display: inline-block; padding: 12px 24px; background: #0a66c2; color: white; text-decoration: none; border-radius: 6px; font-weight: bold; font-size: 16px; }
+        .bookmarklet-link:hover { background: #004182; }
+        code { background: #e8e8e8; padding: 2px 6px; border-radius: 3px; font-size: 13px; }
+        pre { background: #1e1e1e; color: #d4d4d4; padding: 16px; border-radius: 8px; overflow-x: auto; font-size: 13px; }
+        .step { margin: 16px 0; padding: 12px; background: white; border-radius: 8px; border-left: 4px solid #0a66c2; }
+    </style>
+</head>
+<body>
+    <h1>LinkedIn Profile Fetcher</h1>
+    <p>Bookmarklet that fetches LinkedIn profile data using the <strong>Voyager API</strong> — runs entirely in your browser's page context. No automation, no extensions.</p>
+
+    <div class="step">
+        <strong>Step 1:</strong> Drag this link to your bookmarks bar:
+        <br><br>
+        <a class="bookmarklet-link" href="javascript:void(function(){var s=document.querySelector('script[data-li-fetcher]');if(s)return alert('Already running');var s=document.createElement('script');s.textContent='(async function(){var slug=location.pathname.match(/in\\/([^/]+)/);if(!slug)return alert('Not on a LinkedIn profile page. Navigate to a profile first.');slug=slug[1];try{var r=await fetch('/voyager/api/identity/dash/profiles?q=memberIdentity&memberIdentity='+slug+'&decorationId=com.linkedin.voyager.dash.deco.identity.profile.FullProfileWithEntities-93',{credentials:'include',headers:{'accept':'application/vnd.linkedin.normalized+json+2.1','x-restli-protocol-version':'2.0.0','csrf-token':document.cookie.match(/JSESSIONID=([^;]+)/)?.[1]?.replace(/^\"|\"$/g,')||''}});var d=await r.json();var inc=d.included||[];var p=inc.find(function(i){return i.entityUrn&&i.entityUrn.indexOf('fsd_profile:')>-1&&i.firstName});if(!p)return alert('Profile not found in response');var result={name:p.firstName+' '+p.lastName,headline:p.headline||'',location:p.locationName||'',about:p.summary||'',profile_url:'https://www.linkedin.com/in/'+slug};var blob=new Blob([JSON.stringify(result,null,2)],{type:'application/json'});var a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=slug+'-profile.json';a.click();alert('Downloaded: '+result.name)}catch(e){alert('Error: '+e.message)}})();';s.dataset.liFetcher='1';document.head.appendChild(s)})()" onclick="return false;">📋 Fetch LinkedIn Profile</a>
+    </div>
+
+    <div class="step">
+        <strong>Step 2:</strong> Navigate to any LinkedIn profile page (e.g., <code>linkedin.com/in/satyanadella</code>)
+    </div>
+
+    <div class="step">
+        <strong>Step 3:</strong> Click the bookmarklet. It will:
+        <ul>
+            <li>Extract the slug from the current URL</li>
+            <li>Call <code>fetch('/voyager/api/...')</code> from within the page context</li>
+            <li>Download the profile data as JSON</li>
+        </ul>
+    </div>
+
+    <h2>How it works</h2>
+    <p>The bookmarklet runs JavaScript <strong>inside your LinkedIn tab</strong>. When you call <code>fetch()</code> from within the page, it:</p>
+    <ul>
+        <li>Carries the browser's real cookies automatically (no manual cookie extraction)</li>
+        <li>Uses the browser's real TLS fingerprint (no impersonation needed)</li>
+        <li>Participates in the browser's session graph (indistinguishable from manual browsing)</li>
+        <li>No Selenium, Playwright, or Puppeteer — just native browser JS</li>
+    </ul>
+
+    <h2>API approach (for the challenge)</h2>
+    <p>The FastAPI backend uses the same approach server-side: warm-up page load → Voyager API call, with <code>curl_cffi</code> for Chrome TLS impersonation + full cookie jar + browser headers. The bookmarklet is the fallback if the server-side approach triggers LinkedIn's behavioral detection.</p>
+</body>
+</html>
