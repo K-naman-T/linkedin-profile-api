@@ -17,9 +17,7 @@ import tempfile
 import time
 
 
-_DEFAULT_PROFILE = (
-    "/home/knamant/snap/firefox/common/.mozilla/firefox/yiwknvrr.default"
-)
+_DEFAULT_PROFILE = ""  # dev must set FIREFOX_PROFILE_DIR; empty is safe on headless hosts
 
 
 def _profile_dir() -> str:

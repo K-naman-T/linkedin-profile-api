@@ -98,7 +98,7 @@ class _CacheEntry:
 
 
 class _TTLCache:
-    """Bounded in-memory TTL cache (HFT: bounded everything, no unbounded growth)."""
+    """Bounded in-memory TTL cache (: bounded everything, no unbounded growth)."""
 
     def __init__(self, ttl: int = 3600, max_size: int = 1024) -> None:
         self._ttl = ttl
@@ -163,6 +163,9 @@ class LinkedInVoyagerClient:
         headers = dict(_HEADERS)
         headers["csrf-token"] = jsessionid.strip('"')
         # Browser-fidelity headers (close the request fingerprint gap).
+        # X-Li-Track: client telemetry — LinkedIn checks this on every request.
+        # Format reverse-engineered from the LinkedIn web app (voyager-web).
+        import json as _json
         headers.update({
             "accept-language": "en-US,en;q=0.9",
             "origin": "https://www.linkedin.com",
@@ -174,39 +177,30 @@ class LinkedInVoyagerClient:
             "sec-ch-ua": '"Chromium";v="125", "Google Chrome";v="125", "Not.A/Brand";v="99"',
             "sec-ch-ua-mobile": "?0",
             "sec-ch-ua-platform": '"macOS"',
+            "x-li-track": _json.dumps({
+                "clientVersion": "1.0.0",
+                "osName": "macOS",
+                "deviceFormFactor": "DESKTOP",
+                "mpName": "voyager-web",
+                "displayDensity": 1,
+                "displayWidth": 1920,
+                "displayHeight": 1080,
+            }),
         })
         s.headers.update(headers)
         return s
 
-    def _warm_up(self, slug: str) -> None:
-        """Load the profile HTML page to establish a natural navigation flow.
+    def _sync_csrf(self) -> None:
+        """Keep csrf-token header in sync with the live JSESSIONID cookie.
 
-        LinkedIn's session graph expects: page load → XHR. Without this warm-up,
-        an isolated Voyager API call looks like a non-browser client and triggers
-        session revocation within minutes. The page load creates the navigation
-        context that makes the subsequent API call look like a real browser's XHR.
+        curl_cffi auto-stores Set-Cookie updates into the session jar, but the
+        csrf-token header is ours. If JSESSIONID rotates on a response and we
+        don't follow, the NEXT request sends a stale csrf -> 403 -> appears as
+        'logged out after one hit'.
         """
-        import random as _rand
-        url = f"https://www.linkedin.com/in/{slug}/"
-        try:
-            self._session.get(
-                url,
-                timeout=self._timeout,
-                allow_redirects=True,
-                headers={
-                    "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-                    "sec-fetch-dest": "document",
-                    "sec-fetch-mode": "navigate",
-                    "sec-fetch-site": "none",
-                    "sec-fetch-user": "?1",
-                    "upgrade-insecure-requests": "1",
-                    "x-requested-with": "",  # page loads don't set this
-                },
-            )
-        except Exception:
-            pass  # warm-up failure is non-fatal; proceed to API call anyway
-        # Human-like delay between page load and XHR (2-5 seconds)
-        time.sleep(_rand.uniform(2.0, 5.0))
+        js = self._session.cookies.get("JSESSIONID")
+        if js:
+            self._session.headers["csrf-token"] = js.strip('"')
 
     # -- public API --------------------------------------------------------
     def get_profile(self, slug: str) -> Dict[str, Any]:
@@ -215,12 +209,6 @@ class LinkedInVoyagerClient:
         cached = self._cache.get(slug)
         if cached is not None:
             return cached
-
-        # Warm-up: load the profile HTML page first. This creates the natural
-        # navigation flow (page load → XHR) that LinkedIn's session graph
-        # expects. Without it, an isolated Voyager API call looks like a
-        # non-browser client and triggers session revocation.
-        self._warm_up(slug)
 
         primary = self._fetch_dash(slug)
         contact = self._fetch_contact(slug)
@@ -251,13 +239,43 @@ class LinkedInVoyagerClient:
             try:
                 r = self._session.get(url, params=params, timeout=self._timeout,
                                       allow_redirects=False)
+                # JSESSIONID may have rotated in this response (Set-Cookie). Keep
+                # the csrf-token header in lockstep or the NEXT request 403s.
+                self._sync_csrf()
             except Exception as e:
                 if "timed out" in str(e).lower():
                     raise LinkedInUpstreamError(f"Request timed out: {e}") from e
                 raise LinkedInUpstreamError(f"Network error: {e}") from e
 
             if r.status_code == 200:
-                return r.json()
+                # LinkedIn often returns 200 with an HTML bot-check / soft-block
+                # page (not JSON), or 200 + JSON carrying an `exception` key, or
+                # a dash response with no `included`. Treat these as failures so
+                # they don't masquerade as a successful parse.
+                try:
+                    data = r.json()
+                except ValueError:
+                    raise LinkedInUpstreamError(
+                        "LinkedIn returned a non-JSON 200 response (likely a "
+                        "bot-check / soft-block page). Refresh the full cookie jar."
+                    )
+                if isinstance(data, dict) and data.get("exception"):
+                    raise LinkedInAuthError(
+                        "LinkedIn returned an exception payload (session invalid "
+                        "or blocked). Refresh li_at + full cookie jar."
+                    )
+                # The dash endpoint always returns `included` on success. A 200
+                # without it is a soft-block / schema break, not a real profile —
+                # surface as auth so the caller refreshes cookies rather than
+                # misreporting "not found".
+                if (url == DASH_ENDPOINT and isinstance(data, dict)
+                        and "included" not in data):
+                    raise LinkedInAuthError(
+                        "LinkedIn returned a 200 with no `included` (possible "
+                        "soft-block or decoration schema change). Refresh the "
+                        "full cookie jar."
+                    )
+                return data
             # LinkedIn bounces invalid/expired sessions with a 302 back to the
             # same endpoint (self-redirect loop) instead of a clean 401. With a
             # valid session it returns 200 directly, so any 3xx here means the
@@ -268,6 +286,12 @@ class LinkedInVoyagerClient:
                     "invalid. Refresh li_at + JSESSIONID from a logged-in browser."
                 )
             if r.status_code in (401, 403):
+                if attempt == 0:
+                    # Resync may have just fixed a csrf drift. Retry once before
+                    # treating the session as dead. If the li_at is truly revoked,
+                    # the retry will 401/403 again and we surface it.
+                    time.sleep(1.0)
+                    continue
                 raise LinkedInAuthError(
                     "LinkedIn returned 401/403 — cookies expired or invalid. "
                     "Refresh li_at + JSESSIONID from a logged-in browser session."

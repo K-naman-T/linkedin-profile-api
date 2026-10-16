@@ -1,10 +1,11 @@
 """
 Tests for the LinkedIn Voyager client.
 
-Run offline parsing tests (no network):
+Run offline parsing tests (no network, no cookies):
     pytest tests/test_client.py::test_parse_synthetic -q
+    pytest tests/test_client.py::test_slug_normalization -q
 
-Run the live auth gate (requires .env with real burner cookies + network):
+Run the live auth gate (requires a real dedicated cookie jar):
     pytest tests/test_client.py::test_live_gate -q
 """
 import os
@@ -53,9 +54,16 @@ def _synthetic_dash() -> dict:
     }
 
 
+def _patch_included(dash: dict) -> dict:
+    prof = next(i for i in dash["included"] if "fsd_profile:" in i["entityUrn"])
+    prof = dict(prof)
+    prof["_included"] = dash["included"]
+    return prof
+
+
 def test_parse_synthetic(monkeypatch):
     # Build a client without triggering a real request path: monkeypatch _fetch.
-    client = LinkedInVoyagerClient(li_at="x", jsessionid="ajax:1")
+    client = LinkedInVoyagerClient(cookies={"li_at": "x"})
     monkeypatch.setattr(client, "_fetch_dash", lambda slug: _patch_included(_synthetic_dash()))
     monkeypatch.setattr(client, "_fetch_contact", lambda slug: {})
     out = client.get_profile("ada")
@@ -72,35 +80,38 @@ def test_parse_synthetic(monkeypatch):
     assert out["languages"][0]["language"] == "English"
 
 
-def _patch_included(dash: dict) -> dict:
-    prof = next(i for i in dash["included"] if "fsd_profile:" in i["entityUrn"])
-    prof = dict(prof)
-    prof["_included"] = dash["included"]
-    return prof
-
-
 def test_slug_normalization():
-    client = LinkedInVoyagerClient(li_at="x", jsessionid="ajax:1")
+    client = LinkedInVoyagerClient(cookies={"li_at": "x"})
     assert client._normalize_slug("https://www.linkedin.com/in/satyanadella/") == "satyanadella"
     assert client._normalize_slug("satyanadella") == "satyanadella"
 
 
 # ---------------------------------------------------------------------------
-# Live gate (network + real burner cookies in .env)
+# Live gate (real dedicated cookies — Firefox jar on dev, else .env)
 # ---------------------------------------------------------------------------
-def test_live_gate():
-    env = {}
+def _load_jar() -> dict:
+    jar: dict = {}
+    try:
+        from firefox_cookie import get_all_linkedin_cookies
+        jar = get_all_linkedin_cookies()
+    except Exception:
+        pass
     p = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env")
     if os.path.exists(p):
         for line in open(p):
             line = line.strip()
             if "=" in line and not line.startswith("#"):
                 k, v = line.split("=", 1)
-                env[k.strip()] = v.strip()
-    if not env.get("LI_AT_COOKIE") or not env.get("JSESSIONID_COOKIE"):
-        pytest.skip("no .env cookies; skipping live gate")
+                jar.setdefault(k.strip(), v.strip())
+    return jar
 
-    client = LinkedInVoyagerClient(li_at=env["LI_AT_COOKIE"], jsessionid=env["JSESSIONID_COOKIE"])
+
+def test_live_gate():
+    jar = _load_jar()
+    if not jar.get("li_at"):
+        pytest.skip("no li_at cookie (Firefox or .env); skipping live gate")
+
+    client = LinkedInVoyagerClient(cookies=jar)
     out = client.get_profile("satyanadella")
     assert out["basic"]["full_name"]
-    assert "CEO" in out["basic"]["headline"] or out["basic"]["headline"]
+    assert out["basic"]["headline"]

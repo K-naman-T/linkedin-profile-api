@@ -10,11 +10,12 @@ Service:     systemd unit (see deploy/ notes in README).
 """
 from __future__ import annotations
 
+import json
 import os
 import time
 from typing import Dict, Optional
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -57,34 +58,84 @@ _load_dotenv()
 PORT = int(os.environ.get("PORT", "8099"))
 CORS_ORIGINS = os.environ.get("CORS_ORIGINS", "*").split(",")
 RATE_LIMIT_PER_MIN = int(os.environ.get("RATE_LIMIT_PER_MIN", "30"))
+# Optional API key. When set, /profile requires `Authorization: Bearer <key>`
+# (or `?key=<key>`). When unset the API is open (dev mode) — never run the
+# public deployment without API_KEY, or anyone can drive your LinkedIn cookies.
+API_KEY = os.environ.get("API_KEY", "")
+
+
+def _check_auth(request: Request) -> None:
+    if not API_KEY:
+        return  # open/dev mode
+    auth = request.headers.get("authorization", "")
+    key = auth[len("Bearer "):] if auth.startswith("Bearer ") else request.query_params.get("key", "")
+    if key != API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid or missing API key.")
+
+
+def _load_cookies_file() -> Dict[str, str]:
+    """Full cookie jar shipped as cookies.json (gitignored).
+
+    This is the PRIMARY production path: on a headless VPS there is no Firefox,
+    so the full jar (all linkedin.com cookies, not just li_at) MUST come from
+    here — otherwise the session looks like a leaked token and is revoked within
+    minutes (see linkedin_scraper.py RE notes).
+    """
+    p = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookies.json")
+    if not os.path.exists(p):
+        return {}
+    try:
+        with open(p) as fh:
+            data = json.load(fh)
+        return {str(k): str(v) for k, v in data.items()} if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _load_cookies_env() -> Dict[str, str]:
+    """Full cookie jar as a JSON string in LINKEDIN_COOKIES (deploy secret)."""
+    raw = os.environ.get("LINKEDIN_COOKIES", "")
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+        return {str(k): str(v) for k, v in data.items()} if isinstance(data, dict) else {}
+    except Exception:
+        return {}
 
 
 def _load_client() -> Optional[LinkedInVoyagerClient]:
     """Build client from merged auth sources — the fidelity fix.
 
-    Architecture:
-      - li_at (auth token)  → from .env (reliable, user-pasted or env-set)
-      - Device-binding cookies → from local Firefox session (dfpfpt, lidc, bcookie, etc.)
-      - Merge: Firefox jar + .env li_at override → full fingerprint + reliable auth
+    Precedence (later overrides earlier):
+      1. Firefox session jar        — dev only; absent on a headless VPS
+      2. cookies.json file          — full jar, PRIMARY production path
+      3. LINKEDIN_COOKIES env       — full jar, alternate deploy secret
+      4. LI_AT_COOKIE env           — reliable li_at override
 
     Sending only li_at/JSESSIONID looks like a leaked token from a non-standard
     client → session revoked within minutes. The full jar + browser headers makes
     the request indistinguishable from the real frontend.
     """
-    jar: dict[str, str] = {}
+    jar: Dict[str, str] = {}
 
-    # 1) Pull the full device-binding jar from the local Firefox session.
+    # 1) Dev convenience: live Firefox session on THIS machine.
     try:
         from firefox_cookie import get_all_linkedin_cookies
         jar = get_all_linkedin_cookies()
     except Exception:
         pass
 
-    # 2) Ensure li_at is present (may be transient in Firefox DB).
-    #    .env is the reliable source.
+    # 2) + 3) Full jar from file / env — the prod path that survives without Firefox.
+    merged = dict(jar)
+    merged.update(_load_cookies_file())
+    merged.update(_load_cookies_env())
+    jar = merged
+
+    # 4) .env li_at is the reliable auth override.
     env_li_at = os.environ.get("LI_AT_COOKIE", "")
     if env_li_at:
-        jar["li_at"] = env_li_at  # .env overrides if Firefox DB is stale
+        jar["li_at"] = env_li_at
 
     if not jar.get("li_at"):
         return None
@@ -104,7 +155,7 @@ def _refresh_client() -> Optional[LinkedInVoyagerClient]:
     return _load_client()  # _load_client already tries Firefox jar first
 
 
-# Client is built once at startup (HFT: reuse session, no per-request re-auth).
+# Client is built once at startup (: reuse session, no per-request re-auth).
 _CLIENT: Optional[LinkedInVoyagerClient] = _load_client()
 
 
@@ -279,9 +330,21 @@ def _fetch(target: str) -> ProfileResponse:
     try:
         data = client.get_profile(target)
     except LinkedInAuthError:
-        # Session cookie died (LinkedIn invalidates fast). Self-heal: re-read a
-        # fresh li_at from the local Firefox session and retry once.
-        _CLIENT = _refresh_client()
+        # Session cookie died (LinkedIn kills the li_at after one Voyager hit when
+        # the cookie was borrowed from a concurrently-open browser). Preserve the
+        # first result from cache so the demo remains servable.
+        try:
+            cached = client._cache.get(LinkedInVoyagerClient._normalize_slug(target))
+            if cached is not None:
+                return ProfileResponse(
+                    data=cached,
+                    fetched_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                )
+        except Exception:
+            pass
+        new_client = _refresh_client()
+        if new_client is not None:
+            _CLIENT = new_client
         if _CLIENT is None:
             raise HTTPException(
                 status_code=401,
@@ -304,6 +367,7 @@ def _fetch(target: str) -> ProfileResponse:
 def get_profile_by_query(
     url: Optional[str] = Query(None, description="Full LinkedIn profile URL"),
     slug: Optional[str] = Query(None, description="LinkedIn public id / slug"),
+    _: None = Depends(_check_auth),
 ):
     if not url and not slug:
         raise HTTPException(status_code=400, detail="Provide 'url' or 'slug'.")
@@ -311,7 +375,7 @@ def get_profile_by_query(
 
 
 @app.post("/profile", response_model=ProfileResponse, tags=["profiles"])
-def get_profile_by_body(body: dict):
+def get_profile_by_body(body: dict, _: None = Depends(_check_auth)):
     target = body.get("url") or body.get("slug")
     if not target:
         raise HTTPException(status_code=400, detail="Body must contain 'url' or 'slug'.")
